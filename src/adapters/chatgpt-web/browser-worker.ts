@@ -84,7 +84,6 @@ export const CHATGPT_EMPTY_RESPONSE_GRACE_MS = 10_000;
 export const CHATGPT_COMPLETION_ACTION_GRACE_MS = 60_000;
 export const CHATGPT_COMPLETION_SETTLE_MS = 2_000;
 export const CHATGPT_TOOL_CONFIRMATION_TIMEOUT_MS = 60_000;
-export const CHATGPT_MARKDOWN_SEGMENT_SHRINK_GRACE_MS = 2_000;
 const CHATGPT_SMOKE_TEXT = "Reply with exactly: CODEX WEB GPT READY";
 const CHATGPT_SMOKE_EXPECTED = "CODEX WEB GPT READY";
 /**
@@ -245,30 +244,53 @@ const browserStageTimeouts = {
 } as const;
 
 /**
- * CDP accepts large Input.insertText payloads, but a single oversized edit can outrun ChatGPT's
- * Lexical update path. Keep every browser edit below the 139,331-character Send ceiling measured
- * on the current Free/Luna composer. This chunks only the input event; the resulting user message
- * remains one exact prompt and is verified byte-for-byte after insertion.
+ * Keep each native edit small enough that ChatGPT's Lexical editor can commit it without rebuilding
+ * the active block around a six-figure insertion boundary. The resulting user message remains one
+ * exact prompt and is verified after every edit.
  */
-export const CHATGPT_PROMPT_INSERT_CHUNK_CHARS = 100_000;
+export const CHATGPT_PROMPT_INSERT_CHUNK_CHARS = 16_000;
+const CHATGPT_PROMPT_INSERT_BOUNDARY_LOOKBACK_CHARS = 4_096;
+const CHATGPT_PROMPT_GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+const CHATGPT_PROMPT_WHITESPACE = /\s/u;
+const CHATGPT_PROMPT_VERIFICATION_ATTEMPTS = 5;
+const CHATGPT_PROMPT_VERIFICATION_SETTLE_MS = 200;
 export const CHATGPT_COMPOSER_DOCUMENT_END_KEY = process.platform === "darwin"
   ? "Meta+ArrowDown"
   : "Control+End";
 
-function throwIfPromptAttachmentAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) throw new DOMException("ChatGPT prompt attachment aborted", "AbortError");
+function promptInsertChunkEnd(text: string, offset: number): number {
+  const hardEnd = Math.min(offset + CHATGPT_PROMPT_INSERT_CHUNK_CHARS, text.length);
+  if (hardEnd === text.length) return hardEnd;
+
+  const minimumPreferredEnd = Math.max(offset + 1, hardEnd - CHATGPT_PROMPT_INSERT_BOUNDARY_LOOKBACK_CHARS);
+  for (let candidate = hardEnd; candidate >= minimumPreferredEnd; candidate -= 1) {
+    if (!CHATGPT_PROMPT_WHITESPACE.test(text[candidate] ?? "")) continue;
+    let whitespaceStart = candidate;
+    while (whitespaceStart > offset && CHATGPT_PROMPT_WHITESPACE.test(text[whitespaceStart - 1] ?? "")) {
+      whitespaceStart -= 1;
+    }
+    if (whitespaceStart > offset) return whitespaceStart;
+  }
+
+  const segments = CHATGPT_PROMPT_GRAPHEME_SEGMENTER.segment(text);
+  const containingBoundary = segments.containing(hardEnd);
+  let safeEnd = containingBoundary?.index ?? hardEnd;
+  if (safeEnd === hardEnd) {
+    const previousGrapheme = segments.containing(hardEnd - 1);
+    if (previousGrapheme && previousGrapheme.segment.length > 1) safeEnd = previousGrapheme.index;
+  }
+  return safeEnd > offset ? safeEnd : hardEnd;
 }
 
-function promptInsertChunkEnd(text: string, offset: number): number {
-  let end = Math.min(offset + CHATGPT_PROMPT_INSERT_CHUNK_CHARS, text.length);
-  if (end >= text.length) return end;
-  const previousCodeUnit = text.charCodeAt(end - 1);
-  const nextCodeUnit = text.charCodeAt(end);
-  if (previousCodeUnit >= 0xD800 && previousCodeUnit <= 0xDBFF
-    && nextCodeUnit >= 0xDC00 && nextCodeUnit <= 0xDFFF) {
-    end -= 1;
-  }
-  return end;
+function promptCommonPrefixChars(expected: string, observed: string): number {
+  let commonPrefix = 0;
+  while (commonPrefix < expected.length && expected[commonPrefix] === observed[commonPrefix]) commonPrefix += 1;
+  return commonPrefix;
+}
+
+interface ChatGptPromptSubmissionBaseline {
+  initialUserTurnCount: number;
+  initialAssistantTurnCount: number;
 }
 
 export interface BrowserTurn {
@@ -599,6 +621,21 @@ class ChatGptBrowserDiagnostics {
             }));
           const composers = [...document.querySelectorAll(composerSelector)].filter(rendered);
           const assistantTurns = [...document.querySelectorAll(assistantTurnSelector)].filter(rendered);
+          const selection = window.getSelection();
+          const nodePath = (root: Element, node: Node | null): number[] | null => {
+            if (!node || (node !== root && !root.contains(node))) return null;
+            const path: number[] = [];
+            let current: Node = node;
+            while (current !== root) {
+              const parent = current.parentNode;
+              if (!parent) return null;
+              const siblingIndex = [...parent.childNodes].findIndex(child => child === current);
+              if (siblingIndex < 0) return null;
+              path.unshift(siblingIndex);
+              current = parent;
+            }
+            return path;
+          };
           return {
             url: location.href,
             title: document.title,
@@ -608,6 +645,17 @@ class ChatGptBrowserDiagnostics {
             composer: {
               visibleCount: composers.length,
               textChars: composers.map(element => (element.textContent ?? "").length),
+              structures: composers.map(element => ({
+                childTextChars: [...element.childNodes].map(child => (child.textContent ?? "").length),
+                childNodeNames: [...element.childNodes].map(child => child.nodeName),
+                selection: selection ? {
+                  collapsed: selection.isCollapsed,
+                  anchorPath: nodePath(element, selection.anchorNode),
+                  anchorOffset: selection.anchorOffset,
+                  focusPath: nodePath(element, selection.focusNode),
+                  focusOffset: selection.focusOffset,
+                } : null,
+              })),
               selectedConnectors: rows('[data-id^="plugin:"][data-keyword]', 20),
             },
             effortControls: rows(effortControlSelector, 10),
@@ -1133,35 +1181,86 @@ export class ChatGptBrowserWorker {
   private async attachedPromptText(page: Page): Promise<string> {
     const composer = await this.activeComposer(page);
     return composer.evaluate(element => {
-      const clone = element.cloneNode(true) as HTMLElement;
-      clone.querySelectorAll(
-        '[data-id^="plugin:"][data-keyword], [data-inline-selection-pill-cursor-target]',
-      )
-        .forEach(part => part.remove());
-      return [...clone.childNodes]
-        .map(child => child.textContent ?? "")
+      const ignoredSelector = '[data-id^="plugin:"][data-keyword], [data-inline-selection-pill-cursor-target]';
+      const visibleText = (node: Node): string => {
+        if (node instanceof Element && node.matches(ignoredSelector)) return "";
+        if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
+        let text = "";
+        for (const child of node.childNodes) text += visibleText(child);
+        return text;
+      };
+      return [...element.childNodes]
+        .map(child => visibleText(child))
         .join("\n")
         .trimStart();
     }, undefined, { timeout: 20_000 });
   }
 
+  private async promptSubmissionBaseline(page: Page): Promise<ChatGptPromptSubmissionBaseline> {
+    const [initialUserTurnCount, initialAssistantTurnCount] = await Promise.all([
+      page.locator(CHATGPT_USER_TURN_SELECTOR).count(),
+      page.locator(CHATGPT_ASSISTANT_TURN_SELECTOR).count(),
+    ]);
+    return { initialUserTurnCount, initialAssistantTurnCount };
+  }
+
+  private async promptAttachmentSnapshot(
+    page: Page,
+    baseline: ChatGptPromptSubmissionBaseline = { initialUserTurnCount: 0, initialAssistantTurnCount: 0 },
+  ): Promise<{
+    text: string;
+    submissionEvidence?: ChatGptSubmissionEvidence;
+  }> {
+    const [text, userTurnCount, assistantTurnCount, generationRunning] = await Promise.all([
+      this.attachedPromptText(page),
+      page.locator(CHATGPT_USER_TURN_SELECTOR).count(),
+      page.locator(CHATGPT_ASSISTANT_TURN_SELECTOR).count(),
+      page.locator(CHATGPT_STOP_BUTTON_SELECTOR).filter({ visible: true }).count().then(count => count > 0),
+    ]);
+    return {
+      text,
+      submissionEvidence: chatGptSubmissionEvidence({
+        initialUserTurnCount: baseline.initialUserTurnCount,
+        userTurnCount,
+        initialAssistantTurnCount: baseline.initialAssistantTurnCount,
+        assistantTurnCount,
+        generationRunning,
+      }),
+    };
+  }
+
+  private async waitForPromptComposerSettle(): Promise<void> {
+    await new Promise(resolveSleep => setTimeout(resolveSleep, CHATGPT_PROMPT_VERIFICATION_SETTLE_MS));
+  }
+
+  private async exactPromptSnapshot(
+    page: Page,
+    prompt: string,
+    baseline: ChatGptPromptSubmissionBaseline = { initialUserTurnCount: 0, initialAssistantTurnCount: 0 },
+  ): Promise<string> {
+    let observed = "";
+    for (let attempt = 0; attempt < CHATGPT_PROMPT_VERIFICATION_ATTEMPTS; attempt += 1) {
+      await this.waitForPromptComposerSettle();
+      const snapshot = await this.promptAttachmentSnapshot(page, baseline);
+      observed = snapshot.text;
+      if (snapshot.submissionEvidence) {
+        throw new Error(
+          `ChatGPT submitted before prompt verification completed (evidence=${snapshot.submissionEvidence})`,
+        );
+      }
+      if (observed === prompt) return observed;
+    }
+    return observed;
+  }
+
   private async assertPromptAttached(
     page: Page,
     prompt: string,
-    abortSignal?: AbortSignal,
+    baseline: ChatGptPromptSubmissionBaseline = { initialUserTurnCount: 0, initialAssistantTurnCount: 0 },
   ): Promise<void> {
-    const deadline = Date.now() + 10_000;
-    let observed = "";
-    while (Date.now() < deadline) {
-      throwIfPromptAttachmentAborted(abortSignal);
-      observed = await this.attachedPromptText(page);
-      throwIfPromptAttachmentAborted(abortSignal);
-      if (observed === prompt) return;
-      await new Promise(resolveSleep => setTimeout(resolveSleep, 50));
-    }
-    throwIfPromptAttachmentAborted(abortSignal);
-    let commonPrefix = 0;
-    while (commonPrefix < prompt.length && prompt[commonPrefix] === observed[commonPrefix]) commonPrefix += 1;
+    const observed = await this.exactPromptSnapshot(page, prompt, baseline);
+    if (observed === prompt) return;
+    const commonPrefix = promptCommonPrefixChars(prompt, observed);
     throw new Error(
       `ChatGPT composer did not preserve the complete prompt (expectedChars=${prompt.length}, actualChars=${observed.length}, commonPrefixChars=${commonPrefix})`,
     );
@@ -1284,9 +1383,8 @@ export class ChatGptBrowserWorker {
     prompt: string,
     localTools: boolean,
     captureDiagnostic?: (checkpoint: string) => Promise<void>,
-    abortSignal?: AbortSignal,
   ): Promise<void> {
-    throwIfPromptAttachmentAborted(abortSignal);
+    const submissionBaseline = await this.promptSubmissionBaseline(page);
     if (!localTools) {
       const composer = await this.activeComposer(page);
       // Playwright's multiline fill maps through an input action that ChatGPT's Lexical editor can
@@ -1294,31 +1392,31 @@ export class ChatGptBrowserWorker {
       // then transport the complete text in one CDP Input.insertText command.
       await composer.fill("");
       await composer.focus();
-      await this.insertPromptText(page, prompt, abortSignal);
-      await this.assertPromptAttached(page, prompt, abortSignal);
+      await this.insertPromptText(page, prompt, submissionBaseline);
+      await this.assertPromptAttached(page, prompt, submissionBaseline);
       return;
     }
-    const selectedComposer = await this.selectConnector(page, captureDiagnostic);
-    await selectedComposer.focus();
-    await page.keyboard.press(CHATGPT_COMPOSER_DOCUMENT_END_KEY);
-    await this.insertPromptText(page, ` ${prompt}`, abortSignal);
-    await this.assertPromptAttached(page, prompt, abortSignal);
+    await this.selectConnector(page, captureDiagnostic);
+    await this.reanchorPromptCaret(page);
+    await this.insertPromptText(page, ` ${prompt}`, submissionBaseline);
+    await this.assertPromptAttached(page, prompt, submissionBaseline);
   }
 
-  private async reanchorPromptCaret(page: Page, abortSignal?: AbortSignal): Promise<void> {
-    throwIfPromptAttachmentAborted(abortSignal);
+  private async reanchorPromptCaret(page: Page): Promise<void> {
     const composer = await this.activeComposer(page);
     await composer.focus();
-    const anchored = await composer.evaluate(async element => {
+    const anchored = await composer.evaluate(element => {
       const ignoredSelector = '[data-id^="plugin:"][data-keyword], [data-inline-selection-pill-cursor-target]';
-      const editableRootNodes = [...element.childNodes].filter(node => (
-        node.nodeType === Node.TEXT_NODE
-          ? (node.textContent ?? "").length > 0
-          : node instanceof Element && !node.matches(ignoredSelector)
-      ));
-      const finalRootNode = editableRootNodes[editableRootNodes.length - 1];
-      if (!finalRootNode) return false;
+      const editableBlocks: Element[] = [];
+      const collectEditableBlocks = (node: Node): void => {
+        if (node instanceof Element && node.matches(ignoredSelector)) return;
+        if (node instanceof Element && node.tagName === "P") editableBlocks.push(node);
+        for (const child of node.childNodes) collectEditableBlocks(child);
+      };
+      for (const child of element.childNodes) collectEditableBlocks(child);
 
+      const lastEditableBlock = editableBlocks[editableBlocks.length - 1];
+      if (!lastEditableBlock) return false;
       const textNodes: Text[] = [];
       const collectTextNodes = (node: Node): void => {
         if (node instanceof Element && node.matches(ignoredSelector)) return;
@@ -1328,67 +1426,60 @@ export class ChatGptBrowserWorker {
         }
         for (const child of node.childNodes) collectTextNodes(child);
       };
-      collectTextNodes(finalRootNode);
-      const lastTextNode = textNodes[textNodes.length - 1];
-      const cursorTarget = finalRootNode instanceof Element
-        ? finalRootNode.querySelector("[data-inline-selection-pill-cursor-target]")
-        : null;
-
-      let targetNode: Node;
-      let targetOffset: number;
-      const cursorFollowsText = lastTextNode && cursorTarget
-        ? (lastTextNode.compareDocumentPosition(cursorTarget) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0
-        : false;
-      if (cursorTarget?.parentNode && (!lastTextNode || cursorFollowsText)) {
-        targetNode = cursorTarget.parentNode;
-        targetOffset = [...targetNode.childNodes].indexOf(cursorTarget);
-      } else if (lastTextNode) {
-        targetNode = lastTextNode;
-        targetOffset = lastTextNode.data.length;
-      } else if (finalRootNode instanceof Element && !["AREA", "BR", "HR", "IMG", "INPUT"].includes(finalRootNode.tagName)) {
-        targetNode = finalRootNode;
-        targetOffset = finalRootNode.childNodes.length;
-      } else {
-        return false;
-      }
+      collectTextNodes(lastEditableBlock);
+      const cursorTarget = lastEditableBlock.querySelector("[data-inline-selection-pill-cursor-target]");
+      const cursorTargetParent = cursorTarget?.parentNode ?? null;
 
       const selection = window.getSelection();
       if (!selection) return false;
-      const selectionIsExact = (): boolean => selection.isCollapsed
-        && selection.anchorNode === targetNode
-        && selection.anchorOffset === targetOffset
-        && selection.focusNode === targetNode
-        && selection.focusOffset === targetOffset;
-      if (!selectionIsExact()) {
-        const range = document.createRange();
-        range.setStart(targetNode, targetOffset);
+      const lastTextNode = textNodes[textNodes.length - 1];
+      const alreadyAtDocumentEnd = selection.isCollapsed && (
+        lastTextNode
+          ? selection.anchorNode === lastTextNode && selection.anchorOffset === lastTextNode.data.length
+          : cursorTargetParent
+            ? selection.anchorNode === cursorTargetParent
+              && cursorTarget instanceof Node
+              && selection.anchorOffset === [...cursorTargetParent.childNodes].indexOf(cursorTarget)
+            : selection.anchorNode === lastEditableBlock
+              && selection.anchorOffset === lastEditableBlock.childNodes.length
+      );
+      if (alreadyAtDocumentEnd) return true;
+
+      const range = document.createRange();
+      if (lastTextNode) {
+        range.setStart(lastTextNode, lastTextNode.data.length);
         range.collapse(true);
-        selection.removeAllRanges();
-        selection.addRange(range);
+      } else if (cursorTarget) {
+        range.setStartBefore(cursorTarget);
+        range.collapse(true);
+      } else {
+        range.selectNodeContents(lastEditableBlock);
+        range.collapse(false);
       }
-      // BrowserHost disables background throttling for active turn pages. One frame lets Lexical
-      // apply any selection observer before we accept the exact node-and-offset postcondition.
-      await new Promise<void>(resolveFrame => requestAnimationFrame(() => resolveFrame()));
-      return selectionIsExact();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      return selection.isCollapsed
+        && selection.anchorNode !== null
+        && lastEditableBlock.contains(selection.anchorNode);
     }, undefined, { timeout: 20_000 });
-    throwIfPromptAttachmentAborted(abortSignal);
     if (!anchored) {
       throw new Error("ChatGPT composer could not re-anchor the prompt caret at the document end");
     }
   }
 
-  private async insertPromptText(page: Page, text: string, abortSignal?: AbortSignal): Promise<void> {
+  private async insertPromptText(
+    page: Page,
+    text: string,
+    baseline: ChatGptPromptSubmissionBaseline = { initialUserTurnCount: 0, initialAssistantTurnCount: 0 },
+  ): Promise<void> {
     for (let offset = 0; offset < text.length;) {
-      throwIfPromptAttachmentAborted(abortSignal);
       const end = promptInsertChunkEnd(text, offset);
       await page.keyboard.insertText(text.slice(offset, end));
-      throwIfPromptAttachmentAborted(abortSignal);
       if (end < text.length) {
-        // Lexical can rebuild the active block after an exact commit and move its native selection.
-        // Re-anchor only after the verified prefix is stable, before the next irreversible edit.
-        const expectedPrefix = text.slice(0, end).trimStart();
-        await this.waitForPromptChunkAttached(page, expectedPrefix, abortSignal);
-        await this.reanchorPromptCaret(page, abortSignal);
+        // Lexical can rebuild the active block after an exact commit and move the native
+        // selection. Re-anchor only after the verified prefix is stable, before the next input.
+        await this.waitForPromptChunkAttached(page, text.slice(0, end).trimStart(), baseline);
+        await this.reanchorPromptCaret(page);
       }
       offset = end;
     }
@@ -1397,20 +1488,11 @@ export class ChatGptBrowserWorker {
   private async waitForPromptChunkAttached(
     page: Page,
     expected: string,
-    abortSignal?: AbortSignal,
+    baseline: ChatGptPromptSubmissionBaseline = { initialUserTurnCount: 0, initialAssistantTurnCount: 0 },
   ): Promise<void> {
-    const deadline = Date.now() + 20_000;
-    let observed = "";
-    do {
-      throwIfPromptAttachmentAborted(abortSignal);
-      observed = await this.attachedPromptText(page);
-      throwIfPromptAttachmentAborted(abortSignal);
-      if (observed === expected) return;
-      await new Promise(resolveSleep => setTimeout(resolveSleep, 100));
-    } while (Date.now() < deadline);
-    throwIfPromptAttachmentAborted(abortSignal);
-    let commonPrefix = 0;
-    while (commonPrefix < expected.length && expected[commonPrefix] === observed[commonPrefix]) commonPrefix += 1;
+    const observed = await this.exactPromptSnapshot(page, expected, baseline);
+    if (observed === expected) return;
+    const commonPrefix = promptCommonPrefixChars(expected, observed);
     throw new Error(
       `ChatGPT composer did not commit a complete prompt insertion chunk`
       + ` (expectedChars=${expected.length}, actualChars=${observed.length}, commonPrefixChars=${commonPrefix})`,
@@ -1871,18 +1953,9 @@ export class ChatGptBrowserWorker {
         )
       ));
       await diagnostics.capture(page, "effort-selection-complete");
-      await this.runStage(turn.traceId, "prompt_attachment", browserStageTimeouts.promptAttachment, (stageSignal) => {
-        const promptAbortSignal = turn.abortSignal
-          ? AbortSignal.any([stageSignal, turn.abortSignal])
-          : stageSignal;
-        return this.attachPrompt(
-          page,
-          prepared.text,
-          mode.localTools,
-          checkpoint => diagnostics.capture(page, checkpoint),
-          promptAbortSignal,
-        );
-      });
+      await this.runStage(turn.traceId, "prompt_attachment", browserStageTimeouts.promptAttachment, () => (
+        this.attachPrompt(page, prepared.text, mode.localTools, checkpoint => diagnostics.capture(page, checkpoint))
+      ));
       await diagnostics.capture(page, "prompt-attachment-complete");
       await this.runStage(turn.traceId, "file_attachment", browserStageTimeouts.fileAttachment, () => (
         this.attachFiles(page, prepared)
@@ -1926,11 +1999,7 @@ export class ChatGptBrowserWorker {
       let capturedResponse = false;
       const sentAt = Date.now();
       const visibleTrace = new ChatGptVisibleTraceTracker();
-      const markdownBuffer = new ChatGptMarkdownBuffer(
-        markdown => markdown,
-        750,
-        CHATGPT_MARKDOWN_SEGMENT_SHRINK_GRACE_MS,
-      );
+      const markdownBuffer = new ChatGptMarkdownBuffer();
       const checkpointStream = turn.captureLunaCheckpoint
         ? new ChatGptLunaCheckpointStream()
         : undefined;
@@ -1981,7 +2050,7 @@ export class ChatGptBrowserWorker {
             capturedResponse = true;
             await diagnostics.capture(page, "response-visible");
           }
-          const textDelta = markdownBuffer.observe(snapshot.markdownSegments, Date.now(), running);
+          const textDelta = markdownBuffer.observe(snapshot.markdownSegments);
           for (const trace of visibleTrace.observe(snapshot.traceBlocks, snapshot.completionActionVisible)) {
             if (trace.kind === "commentary") turn.onCommentary?.(trace.text, trace.continuation === true);
             else turn.onReasoningSummary?.(trace.text, trace.continuation === true);

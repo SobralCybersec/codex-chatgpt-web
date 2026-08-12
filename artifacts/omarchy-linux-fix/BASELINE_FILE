@@ -644,7 +644,15 @@ async function requestQuit() {
 
 async function start() {
   cdpPort = await findFreePort();
-  if (process.platform === "linux") app.commandLine.appendSwitch("class", "codex-web-gpt");
+  if (process.platform === "linux") {
+    app.commandLine.appendSwitch("class", "codex-web-gpt");
+    // Electron 41 selects native Wayland automatically. Keep GPU compositing enabled for smooth
+    // Hyprland/Omarchy rendering; expose fallbacks only for hosts with a confirmed driver bug.
+    const ozonePlatform = process.env.CODEX_WEB_GPT_OZONE_PLATFORM?.trim();
+    if (ozonePlatform === "x11" || ozonePlatform === "wayland") {
+      app.commandLine.appendSwitch("ozone-platform", ozonePlatform);
+    }
+  }
   app.commandLine.appendSwitch("remote-debugging-address", "127.0.0.1");
   app.commandLine.appendSwitch("remote-debugging-port", String(cdpPort));
 

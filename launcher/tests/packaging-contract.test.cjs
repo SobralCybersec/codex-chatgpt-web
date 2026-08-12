@@ -21,6 +21,22 @@ test("Linux Wayland startup keeps GPU compositing enabled by default", () => {
   assert.doesNotMatch(main, /WAYLAND_DISPLAY|XDG_SESSION_TYPE === "wayland"/);
 });
 
+test("Linux minimized and tray launches keep renderer timers active", () => {
+  const main = fs.readFileSync(path.join(launcherRoot, "electron", "main.cjs"), "utf8");
+  const browserHost = fs.readFileSync(path.join(launcherRoot, "electron", "browser-host.cjs"), "utf8");
+  assert.match(main, /appendSwitch\("disable-renderer-backgrounding"\)/);
+  assert.match(main, /appendSwitch\("disable-background-timer-throttling"\)/);
+  assert.match(main, /sandbox: true,[\s\S]*?backgroundThrottling: false/);
+  assert.match(browserHost, /partition: CHATGPT_PARTITION,[\s\S]*?backgroundThrottling: false/);
+});
+
+test("Linux browser host denies unsupported geolocation probes", () => {
+  const browserHost = fs.readFileSync(path.join(launcherRoot, "electron", "browser-host.cjs"), "utf8");
+  assert.match(browserHost, /setPermissionCheckHandler/);
+  assert.match(browserHost, /setPermissionRequestHandler/);
+  assert.match(browserHost, /permission !== "geolocation"/);
+});
+
 test("launcher publishes native packages for all supported desktop operating systems", () => {
   assert.equal(manifest.build.appId, "dev.codexwebgpt.launcher");
   assert.equal(manifest.build.artifactName, "codex-web-gpt-${version}-${os}-${arch}.${ext}");

@@ -98,6 +98,14 @@ function applyChromeCompatibleUserAgent(contents) {
   contents.setUserAgent(userAgent);
 }
 
+function denyUnsupportedGeolocation(contents) {
+  const session = contents.session;
+  session.setPermissionCheckHandler((_webContents, permission) => permission !== "geolocation");
+  session.setPermissionRequestHandler((_webContents, permission, callback) => {
+    callback(permission !== "geolocation");
+  });
+}
+
 function normalizeBounds(bounds) {
   const read = (value) => Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
   return {
@@ -347,6 +355,7 @@ class BrowserHost {
         backgroundThrottling: false,
       },
     });
+    denyUnsupportedGeolocation(this.view.webContents);
     // ChatGPT redirects an otherwise valid imported session to /auth/login when Chromium's
     // user agent includes Electron's product token. Keep Chromium's real version and platform,
     // but remove only the compatibility-breaking application tokens from every owned view.

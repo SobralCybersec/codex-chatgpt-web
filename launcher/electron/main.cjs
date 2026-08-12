@@ -286,6 +286,7 @@ function createWindow({ logger, stateStore, windowStatePath, startHidden }) {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      backgroundThrottling: false,
       spellcheck: true,
       v8CacheOptions: "bypassHeatCheckAndEagerCompile",
     },
@@ -646,6 +647,11 @@ async function start() {
   cdpPort = await findFreePort();
   if (process.platform === "linux") {
     app.commandLine.appendSwitch("class", "codex-web-gpt");
+    // Keep ChatGPT turns alive when launcher window is minimized or parked in the tray. These
+    // switches preserve renderer timers; WebContentsView backgroundThrottling is disabled below
+    // for the host and turn surfaces as well.
+    app.commandLine.appendSwitch("disable-renderer-backgrounding");
+    app.commandLine.appendSwitch("disable-background-timer-throttling");
     // Electron 41 selects native Wayland automatically. Keep GPU compositing enabled for smooth
     // Hyprland/Omarchy rendering; expose fallbacks only for hosts with a confirmed driver bug.
     const ozonePlatform = process.env.CODEX_WEB_GPT_OZONE_PLATFORM?.trim();

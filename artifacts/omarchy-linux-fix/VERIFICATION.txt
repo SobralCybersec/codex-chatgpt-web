@@ -1,0 +1,52 @@
+OMARCHY LINUX GPU PERFORMANCE FIX VERIFICATION
+
+Changed branch/field:
+launcher/electron/main.cjs:start() Linux branch; native Wayland/GPU is now default. Optional fields: CODEX_WEB_GPT_OZONE_PLATFORM=x11|wayland and CODEX_WEB_GPT_DISABLE_GPU_COMPOSITING=1.
+
+Research decision:
+Electron 41 supports native Wayland automatically. Blanket disable-gpu-compositing was removed because it causes lag. Ozone/GPU fallbacks are opt-in only.
+Sources:
+- https://www.electronjs.org/blog/tech-talk-wayland
+- https://releases.electronjs.org/pr/48301
+- https://www.electronjs.org/docs/latest/api/command-line-switches
+- https://github.com/electron/electron/issues/45862
+
+Four required artifacts:
+MODIFIED_FILE=/home/satu/Documents/Tools/codex-chatgpt-web/artifacts/omarchy-linux-fix/MODIFIED_FILE
+DIFF_FILE=/home/satu/Documents/Tools/codex-chatgpt-web/artifacts/omarchy-linux-fix/DIFF_FILE
+VERIFICATION.txt=/home/satu/Documents/Tools/codex-chatgpt-web/artifacts/omarchy-linux-fix/VERIFICATION.txt
+ROLLBACK.sh=/home/satu/Documents/Tools/codex-chatgpt-web/artifacts/omarchy-linux-fix/ROLLBACK.sh
+
+Source files changed:
+/home/satu/Documents/Tools/codex-chatgpt-web/launcher/electron/main.cjs
+/home/satu/Documents/Tools/codex-chatgpt-web/launcher/tests/packaging-contract.test.cjs
+
+BASELINE
+Command: node --test launcher/tests/browser-host.test.cjs launcher/tests/runtime-supervisor.test.cjs
+Input: repository HEAD source before GPU edit.
+Literal output/result: 101 tests passed, 0 failed, exit 0.
+Exit status: 0.
+
+MODIFIED
+Command: node --test launcher/tests/browser-host.test.cjs launcher/tests/runtime-supervisor.test.cjs launcher/tests/packaging-contract.test.cjs
+Input: native Wayland/GPU default plus opt-in fallback switches.
+Literal output/result: tests 102; pass 102; fail 0; cancelled 0; skipped 0; todo 0; exit 0.
+Exit status: 0.
+
+MODIFIED TYPECHECK
+Command: npx tsc --noEmit -p launcher/tsconfig.json
+Input: modified repository.
+Literal output/result: TypeScript: No errors found.
+Exit status: 0.
+
+ROLLBACK
+Command: /home/satu/Documents/Tools/codex-chatgpt-web/artifacts/omarchy-linux-fix/ROLLBACK.sh /home/satu/Documents/Tools/codex-chatgpt-web/artifacts/omarchy-linux-fix/rollback-test/main.cjs /home/satu/Documents/Tools/codex-chatgpt-web/artifacts/omarchy-linux-fix/BASELINE_FILE
+Input: rollback-test/main.cjs copied from MODIFIED_FILE; BASELINE_FILE generated from HEAD.
+Literal output/result: rollback restored rollback-test/main.cjs; cmp exit=0.
+Exit status: 0.
+Restored behavior/status: rollback-test/main.cjs byte-identical to BASELINE_FILE; MODIFIED_FILE remains changed.
+
+Hashes:
+BASELINE_FILE=b6b300cfb5ff5ecb5f65cf2a7460d7e2aa112e5e7c43a3f06b97e93ba5ebed41
+MODIFIED_FILE=15a8bbe23b35b66c383168a2f917bdd1d12c34d97df4a0b7487d8441a23f20a8
+rollback-test/main.cjs=b6b300cfb5ff5ecb5f65cf2a7460d7e2aa112e5e7c43a3f06b97e93ba5ebed41

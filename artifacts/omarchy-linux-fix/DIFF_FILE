@@ -1,0 +1,24 @@
+diff --git 1/home/satu/Documents/Tools/codex-chatgpt-web/artifacts/omarchy-linux-fix/BASELINE_FILE 2/home/satu/Documents/Tools/codex-chatgpt-web/artifacts/omarchy-linux-fix/MODIFIED_FILE
+index 2561062..90f7c4c 100644
+--- 1/home/satu/Documents/Tools/codex-chatgpt-web/artifacts/omarchy-linux-fix/BASELINE_FILE
++++ 2/home/satu/Documents/Tools/codex-chatgpt-web/artifacts/omarchy-linux-fix/MODIFIED_FILE
+@@ -644,7 +644,18 @@ async function requestQuit() {
+ 
+ async function start() {
+   cdpPort = await findFreePort();
+-  if (process.platform === "linux") app.commandLine.appendSwitch("class", "codex-web-gpt");
++  if (process.platform === "linux") {
++    app.commandLine.appendSwitch("class", "codex-web-gpt");
++    // Electron 41 selects native Wayland automatically. Keep GPU compositing enabled for smooth
++    // Hyprland/Omarchy rendering; expose fallbacks only for hosts with a confirmed driver bug.
++    const ozonePlatform = process.env.CODEX_WEB_GPT_OZONE_PLATFORM?.trim();
++    if (ozonePlatform === "x11" || ozonePlatform === "wayland") {
++      app.commandLine.appendSwitch("ozone-platform", ozonePlatform);
++    }
++    if (process.env.CODEX_WEB_GPT_DISABLE_GPU_COMPOSITING === "1") {
++      app.commandLine.appendSwitch("disable-gpu-compositing");
++    }
++  }
+   app.commandLine.appendSwitch("remote-debugging-address", "127.0.0.1");
+   app.commandLine.appendSwitch("remote-debugging-port", String(cdpPort));
+ 

@@ -13,6 +13,14 @@ test("the public launcher command uses the Electron bootstrap", () => {
   assert.equal(repositoryManifest.scripts.launcher, repositoryManifest.scripts.app);
 });
 
+test("Linux Wayland startup keeps GPU compositing enabled by default", () => {
+  const main = fs.readFileSync(path.join(launcherRoot, "electron", "main.cjs"), "utf8");
+  assert.match(main, /CODEX_WEB_GPT_OZONE_PLATFORM/);
+  assert.match(main, /appendSwitch\("ozone-platform", ozonePlatform\)/);
+  assert.match(main, /CODEX_WEB_GPT_DISABLE_GPU_COMPOSITING === "1"/);
+  assert.doesNotMatch(main, /WAYLAND_DISPLAY|XDG_SESSION_TYPE === "wayland"/);
+});
+
 test("launcher publishes native packages for all supported desktop operating systems", () => {
   assert.equal(manifest.build.appId, "dev.codexwebgpt.launcher");
   assert.equal(manifest.build.artifactName, "codex-web-gpt-${version}-${os}-${arch}.${ext}");
